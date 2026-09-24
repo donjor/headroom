@@ -1185,8 +1185,12 @@ def test_openai_cache_mode_forwards_last_turns_bytes_unchanged(stream: bool) -> 
     assert sent[2][: len(sent[1])] == sent[1]
 
 
-def test_openai_chat_custom_base_reports_zai_as_outcome_provider() -> None:
+def test_openai_chat_custom_base_reports_zai_as_outcome_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """An OpenAI-compatible ``x-headroom-base-url`` upstream is not ``openai``."""
+    # Allowlist the host so the SSRF guard does not need live DNS.
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "api.z.ai")
     captured = {}
     with _make_proxy_client() as client:
         proxy = client.app.state.proxy
