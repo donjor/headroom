@@ -87,10 +87,10 @@ from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
+from headroom.proxy.passthrough import CUSTOM_BASE_PROVIDER, is_opencode_zen_base
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
-from headroom.proxy.passthrough import is_opencode_zen_base
 from headroom.proxy.project_context import (
     classify_project,
     get_current_project,
@@ -376,24 +376,6 @@ def _resolve_openai_handler_path(
         return f"/v1{handler_path}"
 
     return parsed.path
-
-
-def _custom_base_provider_label(base_url: str | None) -> str | None:
-    """Telemetry label for a per-request ``x-headroom-base-url`` upstream.
-
-    Display only: the hostname minus a leading ``api.`` so an OpenAI-compatible
-    provider routed through the chat path (``api.z.ai`` -> ``z.ai``) stops
-    reporting as ``openai``. Request formatting and pricing still key on openai.
-    """
-    if not base_url:
-        return None
-    try:
-        host = (urlparse(base_url).hostname or "").lower()
-    except ValueError:
-        return None
-    if not host or host == "api.openai.com":
-        return None
-    return host[4:] if host.startswith("api.") else host
 
 
 def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None:
@@ -3528,8 +3510,11 @@ class OpenAIHandlerMixin:
             handler_path,
             upstream_base_url or "",
         )
-        openai_chat_outcome_provider = (
-            custom_chat_provider or _custom_base_provider_label(upstream_base_url) or "openai"
+        # Fixed taxonomy from the shared helper (zen, zai, meta, openai); any
+        # other custom base is the shared "custom" bucket. Never derive the
+        # label from the request-controlled hostname — see the review on #3759.
+        openai_chat_outcome_provider = custom_chat_provider or (
+            CUSTOM_BASE_PROVIDER if upstream_base_url else "openai"
         )
 
         # Memory: Get user ID when memory is enabled. Reads `request.headers`

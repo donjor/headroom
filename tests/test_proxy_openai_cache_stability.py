@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import pathlib
+import re
 from types import SimpleNamespace
 
 import httpx
@@ -566,7 +568,7 @@ def test_openai_handler_replays_the_provider_confirmed_prefix_even_when_it_infla
     assert captured["body"]["messages"][1] == {"role": "user", "content": "new suffix"}
 
 
-def test_openai_chat_custom_base_reports_its_host_as_outcome_provider() -> None:
+def test_openai_chat_custom_base_reports_zai_as_outcome_provider() -> None:
     """An OpenAI-compatible ``x-headroom-base-url`` upstream is not ``openai``."""
     captured = {}
     with _make_proxy_client() as client:
@@ -590,4 +592,152 @@ def test_openai_chat_custom_base_reports_its_host_as_outcome_provider() -> None:
             },
         )
 
-    assert captured.get("outcome_provider") == "z.ai"
+    assert captured.get("outcome_provider") == "zai"
+
+
+def test_openai_chat_outcome_provider_uses_the_fixed_taxonomy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Buffered chat labels each custom base from the fixed set, never the host."""
+    # Keep the SSRF guard out of the way: these hosts are deliberately
+    # unresolvable, and a DNS miss makes the handler ignore the override.
+    monkeypatch.setattr("headroom.proxy.handlers.openai.is_safe_upstream_url", lambda url: True)
+    # Keep the lifetime savings store out of the user's real on-disk state.
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "savings.json"))
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl_1",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        def _chat(base: str | None) -> None:
+            headers = {"authorization": "Bearer test-key"}
+            if base is not None:
+                headers["x-headroom-base-url"] = base
+            response = client.post(
+                "/v1/chat/completions",
+                headers=headers,
+                json={"model": "glm-5", "messages": [{"role": "user", "content": "hi"}]},
+            )
+            assert response.status_code == 200
+
+        _chat("https://api.meta.ai/v1")
+        _chat("https://api.meta.ai/v1/sub")
+        _chat("https://llm.example.internal/v1")
+        # No header: the plain OpenAI path keeps its own label (control).
+        _chat(None)
+
+        by_provider = proxy.metrics.requests_by_provider
+        assert by_provider["meta"] == 2
+        assert by_provider["custom"] == 1
+        assert by_provider["openai"] == 1
+
+
+def test_openai_chat_custom_base_flood_cannot_grow_the_provider_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Regression for the #3759 review: a host flood stays inside the fixed set.
+
+    The old code derived the outcome provider from the request-controlled
+    ``x-headroom-base-url`` hostname, so one fresh hostname per request grew
+    the provider stores and exported series without bound. The taxonomy is
+    fixed, so 1,000 distinct hosts must stay inside
+    ``{openai, zen, zai, meta, custom}`` while known z.ai traffic stays
+    distinguishable from the flood's ``custom`` bucket.
+    """
+    fixed_providers = {"openai", "zen", "zai", "meta", "custom"}
+    zai_base = "https://api.z.ai/api/coding/paas/v4"
+    flood_ok = flood_failed = zai_requests = 0
+    # The flood hosts are unresolvable on purpose; without this stub the SSRF
+    # guard would drop the override and relabel the flood as "openai".
+    monkeypatch.setattr("headroom.proxy.handlers.openai.is_safe_upstream_url", lambda url: True)
+    # Persist nowhere: SavingsTracker saves its lifetime state to the default
+    # on-disk store, and this test's flood labels must never reach it.
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "savings.json"))
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            if "flood-fail-" in url:
+                raise httpx.ConnectError("flood host down")
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl_flood",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        for i in range(1000):
+            if i % 50 == 0:
+                base = zai_base
+                zai_requests += 1
+            elif i % 3 == 0:
+                base = f"https://flood-fail-{i}.example.invalid/v1"
+                flood_failed += 1
+            else:
+                base = f"https://flood-ok-{i}.example.invalid/v1"
+                flood_ok += 1
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"authorization": "Bearer test-key", "x-headroom-base-url": base},
+                json={"model": "glm-5", "messages": [{"role": "user", "content": f"turn {i}"}]},
+            )
+            assert response.status_code in (200, 502)
+
+        by_provider = dict(proxy.metrics.requests_by_provider)
+        failed_by_provider = dict(proxy.metrics.requests_failed_by_provider)
+
+        # z.ai stays its own bucket, separate from the flood's "custom".
+        assert zai_requests == 20
+        assert by_provider.get("zai") == 20
+        assert by_provider.get("custom") == flood_ok
+        assert failed_by_provider.get("custom") == flood_failed
+
+        # No sink grew a label outside the fixed set ("unknown" is the
+        # metrics module's seeded no-provider bucket).
+        for sink, store in (("success", by_provider), ("failure", failed_by_provider)):
+            extra = set(store) - fixed_providers - {"unknown"}
+            assert not extra, f"{sink} sink grew unbounded labels: {sorted(extra)[:5]}"
+
+        # The persistent lifetime breakdown also shares labels with other
+        # subsystems (anthropic, copilot, ...), so assert the precise claim:
+        # no flood hostname reaches it (it would under the old label code,
+        # before its own top-32 compaction hides the rest).
+        lifetime = proxy.metrics.savings_tracker.lifetime_response()
+        for key in ("by_provider", "failed_by_provider"):
+            flood_labels = [
+                p for p in lifetime["requests"].get(key, {}) if "flood-" in p or ".invalid" in p
+            ]
+            assert not flood_labels, f"lifetime {key} grew flood-host labels: {flood_labels[:5]}"
+
+        # And the Prometheus export only carries fixed provider series.
+        export = client.get("/metrics").text
+        exported_providers = set(re.findall(r'provider="([^"]+)"', export))
+        assert exported_providers, "expected provider series in the export"
+        assert not any(".invalid" in p or "flood-" in p for p in exported_providers)
+        assert {"zai", "custom"} <= exported_providers
