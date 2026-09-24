@@ -13,8 +13,12 @@ import pytest
 pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
+from headroom.observability import HeadroomOtelMetrics, reset_otel_metrics, set_otel_metrics
 from headroom.proxy.server import ProxyConfig, create_app
+from tests.test_observability_metrics import _collect_metrics
 
 
 class _FakePrefixTracker:
@@ -655,89 +659,125 @@ def test_openai_chat_custom_base_flood_cannot_grow_the_provider_set(
 
     The old code derived the outcome provider from the request-controlled
     ``x-headroom-base-url`` hostname, so one fresh hostname per request grew
-    the provider stores and exported series without bound. The taxonomy is
-    fixed, so 1,000 distinct hosts must stay inside
-    ``{openai, zen, zai, meta, custom}`` while known z.ai traffic stays
-    distinguishable from the flood's ``custom`` bucket.
+    the provider stores and exported series without bound. 980 distinct flood
+    hosts plus 20 z.ai requests cover success, upstream failure, local 429 and
+    upstream 429, and every sink must count exactly ``zai`` and ``custom``.
     """
     fixed_providers = {"openai", "zen", "zai", "meta", "custom"}
     zai_base = "https://api.z.ai/api/coding/paas/v4"
-    flood_ok = flood_failed = zai_requests = 0
+    limited_auth = "Bearer rate-limited"
     # The flood hosts are unresolvable on purpose; without this stub the SSRF
     # guard would drop the override and relabel the flood as "openai".
     monkeypatch.setattr("headroom.proxy.handlers.openai.is_safe_upstream_url", lambda url: True)
-    # Persist nowhere: SavingsTracker saves its lifetime state to the default
-    # on-disk store, and this test's flood labels must never reach it.
+    # Isolated sinks: a fresh lifetime store and workspace, so the exact
+    # counts below are this test's traffic and nothing reaches ~/.headroom.
     monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "savings.json"))
-    with _make_proxy_client() as client:
-        proxy = client.app.state.proxy
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "workspace"))
+    reader = InMemoryMetricReader()
+    set_otel_metrics(HeadroomOtelMetrics(meter_provider=MeterProvider(metric_readers=[reader])))
 
-        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001, ANN002, ANN003
-            if "flood-fail-" in url:
-                raise httpx.ConnectError("flood host down")
-            return httpx.Response(
-                200,
-                json={
-                    "id": "chatcmpl_flood",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": "ok"},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                    "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
-                },
-            )
+    class _LimitOneKey:
+        """Headroom's own limiter, refusing only ``limited_auth``."""
 
-        proxy._retry_request = _fake_retry
+        async def check_request(self, key: str = "default") -> tuple[bool, float]:
+            return key != limited_auth, 1.0
 
-        for i in range(1000):
-            if i % 50 == 0:
-                base = zai_base
-                zai_requests += 1
-            elif i % 3 == 0:
-                base = f"https://flood-fail-{i}.example.invalid/v1"
-                flood_failed += 1
-            else:
-                base = f"https://flood-ok-{i}.example.invalid/v1"
-                flood_ok += 1
-            response = client.post(
-                "/v1/chat/completions",
-                headers={"authorization": "Bearer test-key", "x-headroom-base-url": base},
-                json={"model": "glm-5", "messages": [{"role": "user", "content": f"turn {i}"}]},
-            )
-            assert response.status_code in (200, 502)
+    async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        if "flood-down-" in url:
+            raise httpx.ConnectError("flood host down")
+        if "flood-upstream429-" in url:
+            return httpx.Response(429, json={"error": {"message": "slow down"}})
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl_flood",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+            },
+        )
 
-        by_provider = dict(proxy.metrics.requests_by_provider)
-        failed_by_provider = dict(proxy.metrics.requests_failed_by_provider)
+    expected_status = {"ok": 200, "down": 502, "limited": 429, "upstream429": 429}
+    sent: dict[tuple[str, str], int] = {}
+    flood_hosts: set[str] = set()
+    try:
+        with _make_proxy_client() as client:
+            proxy = client.app.state.proxy
+            proxy._retry_request = _fake_retry
+            proxy.rate_limiter = _LimitOneKey()
 
-        # z.ai stays its own bucket, separate from the flood's "custom".
-        assert zai_requests == 20
-        assert by_provider.get("zai") == 20
-        assert by_provider.get("custom") == flood_ok
-        assert failed_by_provider.get("custom") == flood_failed
+            for i in range(1000):
+                if i % 50 == 0:
+                    provider, kind = "zai", ("ok" if i % 100 == 0 else "limited")
+                    base = zai_base
+                else:
+                    provider, kind = "custom", ("limited", "upstream429", "down", "ok")[i % 4]
+                    host = f"flood-{kind}-{i}.example.invalid"
+                    flood_hosts.add(host)
+                    base = f"https://{host}/v1"
+                sent[provider, kind] = sent.get((provider, kind), 0) + 1
+                auth = limited_auth if kind == "limited" else "Bearer test-key"
+                response = client.post(
+                    "/v1/chat/completions",
+                    headers={"authorization": auth, "x-headroom-base-url": base},
+                    json={"model": "glm-5", "messages": [{"role": "user", "content": f"turn {i}"}]},
+                )
+                assert response.status_code == expected_status[kind], (i, base)
 
-        # No sink grew a label outside the fixed set ("unknown" is the
-        # metrics module's seeded no-provider bucket).
-        for sink, store in (("success", by_provider), ("failure", failed_by_provider)):
-            extra = set(store) - fixed_providers - {"unknown"}
-            assert not extra, f"{sink} sink grew unbounded labels: {sorted(extra)[:5]}"
+            # The traffic this test sends, pinned so the claim stays exact.
+            assert len(flood_hosts) == 980
+            assert sent == {
+                ("zai", "ok"): 10,
+                ("zai", "limited"): 10,
+                ("custom", "ok"): 250,
+                ("custom", "down"): 240,
+                ("custom", "limited"): 240,
+                ("custom", "upstream429"): 250,
+            }
 
-        # The persistent lifetime breakdown also shares labels with other
-        # subsystems (anthropic, copilot, ...), so assert the precise claim:
-        # no flood hostname reaches it (it would under the old label code,
-        # before its own top-32 compaction hides the rest).
-        lifetime = proxy.metrics.savings_tracker.lifetime_response()
-        for key in ("by_provider", "failed_by_provider"):
-            flood_labels = [
-                p for p in lifetime["requests"].get(key, {}) if "flood-" in p or ".invalid" in p
-            ]
-            assert not flood_labels, f"lifetime {key} grew flood-host labels: {flood_labels[:5]}"
+            metrics = proxy.metrics
+            # In-memory stores: exact counts; "unknown" is the seeded zero bucket.
+            assert dict(metrics.requests_by_provider) == {"zai": 10, "custom": 250}
+            assert dict(metrics.requests_failed_by_provider) == {"unknown": 0, "custom": 240}
+            assert metrics.requests_rate_limited_by_source == {"headroom": 250, "upstream": 250}
 
-        # And the Prometheus export only carries fixed provider series.
-        export = client.get("/metrics").text
-        exported_providers = set(re.findall(r'provider="([^"]+)"', export))
-        assert exported_providers, "expected provider series in the export"
-        assert not any(".invalid" in p or "flood-" in p for p in exported_providers)
-        assert {"zai", "custom"} <= exported_providers
+            # Lifetime store, isolated under tmp_path.
+            lifetime = metrics.savings_tracker.lifetime_response()["requests"]
+            assert lifetime["by_provider"] == {"zai": 10, "custom": 250}
+            assert lifetime["failed_by_provider"] == {"custom": 240}
+            assert lifetime["rate_limited_by_source"] == {"headroom": 250, "upstream": 250}
+
+            # Prometheus export: every provider series is from the fixed set.
+            export = client.get("/metrics").text
+            assert set(re.findall(r'provider="([^"]+)"', export)) <= fixed_providers | {"unknown"}
+            assert 'headroom_requests_by_provider{provider="zai"} 10' in export
+            assert 'headroom_requests_by_provider{provider="custom"} 250' in export
+
+        # OTel: every proxy data point carries a fixed provider attribute, and
+        # z.ai stays its own series on the success and local-429 paths.
+        otel = _collect_metrics(reader)
+        otel_points: dict[tuple[str, str, str], float] = {}
+        for name, metric in otel.items():
+            if not name.startswith("headroom.proxy."):
+                continue
+            for point in metric.data.data_points:
+                label = point.attributes.get("provider")
+                assert label in fixed_providers, (name, label)
+                if name.startswith("headroom.proxy.requests"):
+                    key = (name, label, point.attributes.get("source", ""))
+                    otel_points[key] = otel_points.get(key, 0) + point.value
+        assert otel_points == {
+            ("headroom.proxy.requests", "zai", ""): 10,
+            ("headroom.proxy.requests", "custom", ""): 250,
+            ("headroom.proxy.requests.failed", "custom", ""): 240,
+            ("headroom.proxy.requests.rate_limited", "zai", "headroom"): 10,
+            ("headroom.proxy.requests.rate_limited", "custom", "headroom"): 240,
+            ("headroom.proxy.requests.rate_limited", "custom", "upstream"): 250,
+        }
+    finally:
+        reset_otel_metrics()
