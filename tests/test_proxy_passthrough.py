@@ -49,3 +49,14 @@ def test_is_opencode_zen_base_rejects_other_or_missing_bases() -> None:
     assert not is_opencode_zen_base("https://custom.example")
     assert not is_opencode_zen_base("https://opencode.ai.evil.example")
     assert not is_opencode_zen_base("://bad-url")
+
+
+def test_custom_base_provider_label_names_openai_compatible_hosts() -> None:
+    from headroom.proxy.handlers.openai import _custom_base_provider_label
+
+    assert _custom_base_provider_label("https://api.z.ai/api/coding/paas/v4") == "z.ai"
+    assert _custom_base_provider_label("https://open.bigmodel.cn/api") == "open.bigmodel.cn"
+    assert _custom_base_provider_label("https://api.openai.com/v1") is None
+    assert _custom_base_provider_label(None) is None
+    assert _custom_base_provider_label("") is None
+    assert _custom_base_provider_label("://bad-url") is None

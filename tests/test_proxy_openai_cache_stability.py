@@ -564,3 +564,30 @@ def test_openai_handler_replays_the_provider_confirmed_prefix_even_when_it_infla
     assert response.status_code == 200
     assert captured["body"]["messages"][0] == previous_forwarded[0]
     assert captured["body"]["messages"][1] == {"role": "user", "content": "new suffix"}
+
+
+def test_openai_chat_custom_base_reports_its_host_as_outcome_provider() -> None:
+    """An OpenAI-compatible ``x-headroom-base-url`` upstream is not ``openai``."""
+    captured = {}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+
+        async def _fake_stream_response(*args, **kwargs):  # noqa: ANN002, ANN003
+            captured.update(kwargs)
+            return httpx.Response(200, text="data: [DONE]\n\n")
+
+        proxy._stream_response = _fake_stream_response
+        client.post(
+            "/v1/chat/completions",
+            headers={
+                "authorization": "Bearer test-key",
+                "x-headroom-base-url": "https://api.z.ai/api/coding/paas/v4",
+            },
+            json={
+                "model": "glm-5",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert captured.get("outcome_provider") == "z.ai"

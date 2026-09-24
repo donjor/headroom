@@ -378,6 +378,24 @@ def _resolve_openai_handler_path(
     return parsed.path
 
 
+def _custom_base_provider_label(base_url: str | None) -> str | None:
+    """Telemetry label for a per-request ``x-headroom-base-url`` upstream.
+
+    Display only: the hostname minus a leading ``api.`` so an OpenAI-compatible
+    provider routed through the chat path (``api.z.ai`` -> ``z.ai``) stops
+    reporting as ``openai``. Request formatting and pricing still key on openai.
+    """
+    if not base_url:
+        return None
+    try:
+        host = (urlparse(base_url).hostname or "").lower()
+    except ValueError:
+        return None
+    if not host or host == "api.openai.com":
+        return None
+    return host[4:] if host.startswith("api.") else host
+
+
 def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None:
     raw_base_url = _header_get(request_headers, _OPENAI_BASE_URL_HEADER)
     if raw_base_url is None:
@@ -3510,7 +3528,9 @@ class OpenAIHandlerMixin:
             handler_path,
             upstream_base_url or "",
         )
-        openai_chat_outcome_provider = custom_chat_provider or "openai"
+        openai_chat_outcome_provider = (
+            custom_chat_provider or _custom_base_provider_label(upstream_base_url) or "openai"
+        )
 
         # Memory: Get user ID when memory is enabled. Reads `request.headers`
         # directly because `headers` was stripped of `x-headroom-*` for the
