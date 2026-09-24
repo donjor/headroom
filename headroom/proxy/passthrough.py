@@ -56,7 +56,11 @@ def custom_base_passthrough_telemetry(method: str, path: str, base_url: str) -> 
     # Known OpenAI-compatible chat hosts get a fixed name; chat-completions
     # traffic on any other custom base is the shared "custom" bucket and
     # everything else stays unnamed so tool traffic is not LLM telemetry.
+    # Match whole path segments so ``/v1/notchat/completions`` stays unnamed.
     provider = CUSTOM_BASE_CHAT_PROVIDERS.get(host)
-    if provider is not None and normalized_path.endswith("chat/completions"):
+    is_chat_path = normalized_path == "chat/completions" or normalized_path.endswith(
+        "/chat/completions"
+    )
+    if provider is not None and is_chat_path:
         return "chat/completions", provider
     return "", ""

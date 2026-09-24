@@ -106,3 +106,15 @@ def test_custom_base_passthrough_telemetry_keeps_everything_else_unnamed() -> No
         "/v1/chat/completions",
         "://bad-url",
     ) == ("", "")
+
+
+def test_custom_base_passthrough_telemetry_requires_a_chat_path_segment() -> None:
+    # A bare suffix match would also name ``notchat/completions``.
+    for path in ("/v1/notchat/completions", "/v1/xchat/completions", "notchat/completions"):
+        assert custom_base_passthrough_telemetry("POST", path, "https://api.z.ai/v1") == ("", "")
+    # The exact segment, bare or nested, still names the host.
+    for path in ("chat/completions", "/chat/completions", "/api/paas/v4/chat/completions"):
+        assert custom_base_passthrough_telemetry("POST", path, "https://api.z.ai/v1") == (
+            "chat/completions",
+            "zai",
+        )
