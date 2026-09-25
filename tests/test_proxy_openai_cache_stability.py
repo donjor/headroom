@@ -1299,6 +1299,9 @@ def test_openai_chat_custom_base_flood_cannot_grow_the_provider_set(
         async def check_request(self, key: str = "default") -> tuple[bool, float]:
             return key != limited_auth, 1.0
 
+        async def check_tokens(self, key: str, tokens: int) -> tuple[bool, float]:
+            return True, 0.0
+
     async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001, ANN002, ANN003
         if "flood-down-" in url:
             raise httpx.ConnectError("flood host down")
